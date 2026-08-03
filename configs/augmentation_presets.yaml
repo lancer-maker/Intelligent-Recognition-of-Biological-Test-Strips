@@ -1,0 +1,38 @@
+# 数据增强预设配置文件，将增强强度与代码解耦，方便后续做消融实验
+# =====================================================================
+# Albumentations 数据增强预设配置文件
+# =====================================================================
+
+# 1. 默认标准训练增强预设 (用于日常模型训练)
+medium_train:
+  brightness_contrast:
+    brightness_limit: 0.4
+    contrast_limit: 0.4
+    p: 0.5
+  gauss_noise:
+    var_limit: [5.0, 15.0]
+    p: 0.3
+  gaussian_blur:
+    blur_limit: [3, 5]
+    p: 0.2
+  coarse_dropout:               # 模拟污渍/气泡遮挡
+    max_holes: 2
+    max_height: 20
+    max_width: 40
+    fill_value: 0
+    p: 0.3
+  shift_scale:                  # 微小平移缩放 (绝无旋转)
+    shift_limit: 0.03
+    scale_limit: 0.05
+    rotate_limit: 0
+    p: 0.5
+  clahe:                        # 增强微弱条带对比度
+    clip_limit: 2.0
+    tile_grid_size: [8, 8]
+    p: 0.3
+
+# 2. 验证集/测试集预设 (仅标准化，绝无随机扰动)
+val_eval:
+  normalize:
+    mean: [0.485, 0.456, 0.406]  # ImageNet 标准均值
+    std: [0.229, 0.224, 0.225]   # ImageNet 标准方差

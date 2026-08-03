@@ -1,0 +1,57 @@
+# 主配置文件
+# =====================================================================
+# 免疫层析试纸自动判读系统主配置文件
+# =====================================================================
+
+# 1. 基础与硬件配置
+system:
+  project_name: "immunoassay_strip_reader"
+  seed: 42                       # 全局随机种子，确保实验可复现
+  device: "cuda"                 # 'cuda' 或 'cpu'
+  num_workers: 4                 # DataLoader 多线程加载数
+
+# 2. 数据配置
+data:
+  orig_csv_path: "D:\\software\\vscode\\TOXY\\data\\labels\\P\\labels.csv"      # 24例原始数据标注的具体文件路径
+  anon_csv_path: "D:\\software\\vscode\\TOXY\\data\\labels\\N\\labels.csv"     # 16例匿名增广标注
+  qc_image_dir: "data/raw/control_strips"               # 质控纸带目录 # 可能后续用不到这个判断模块
+  standard_dpi_size: [220, 505]  # [Width, Height] 2D 物理 DPI 对齐尺寸
+  proj_length: 512               # 1D 物理信号重采样点数
+
+# 3. 模型架构配置
+model:
+  backbone_2d: "efficientnet_b0" # 2D 图像流骨干网络
+  pretrained: true               # 是否加载 ImageNet 预训练权重
+  feature_dim: 128               # 每个单流提取的特征维度 (2D:128, 1D:128)
+  dropout_rate: 0.5              # 分类头 Dropout 概率
+
+# 4. 两阶段训练策略配置
+training:
+  optimizer: "AdamW"
+  weight_decay: 0.001            # 权重衰减 (L2 正则化)
+  early_stopping_patience: 5     # 验证集 Loss 连续不下降允许的最大 Epoch 数
+  
+  # 阶段一：冻结 EfficientNet，训练 1D CNN 和分类头
+  stage1:
+    epochs: 20
+    batch_size: 16
+    learning_rate: 0.0001        # 1e-4
+
+  # 阶段二：解冻 EfficientNet 全局微调
+  stage2:
+    epochs: 10
+    batch_size: 8
+    learning_rate: 0.00001       # 1e-5
+
+# 5. 评估与阈值寻优策略配置
+evaluation:
+  num_patients: 24               # 留一交叉验证 (LOOCV) 患者数，即每次训练使用 23 个患者，剩余 1 个患者用于验证，防止所有数据混合训练
+  default_threshold: 0.5         # 默认比较阈值
+  optimize_threshold: true       # 是否开启基于约登指数 (Youden Index) 的阈值寻优
+
+# 6. 输出与导出配置
+output:
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir: "outputs/logs"
+  onnx_dir: "outputs/onnx_models"
+  onnx_filename: "dual_stream_strip_net.onnx"

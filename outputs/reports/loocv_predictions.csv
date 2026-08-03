@@ -1,0 +1,16 @@
+filename,label,item_id,patient_id,pred_prob,pred_label
+D:\software\vscode\TOXY\data\raw\P-24\P01_01_1.png,1,1,1,0.65634346,1
+D:\software\vscode\TOXY\data\raw\P-24\P01_02_1.png,1,2,1,0.6673331,1
+D:\software\vscode\TOXY\data\raw\P-24\P01_03_1.png,1,3,1,0.6811475,1
+D:\software\vscode\TOXY\data\raw\P-24\P01_04_0.png,0,4,1,0.3430998,0
+D:\software\vscode\TOXY\data\raw\P-24\P01_05_0.png,0,5,1,0.605734,0
+D:\software\vscode\TOXY\data\raw\P-24\P01_06_0.png,0,6,1,0.38625494,0
+D:\software\vscode\TOXY\data\raw\P-24\P01_07_1.png,1,7,1,0.6727624,1
+D:\software\vscode\TOXY\data\raw\P-24\P01_08_0.png,0,8,1,0.37973857,0
+D:\software\vscode\TOXY\data\raw\P-24\P02_01_1.png,1,1,2,0.6175775,1
+D:\software\vscode\TOXY\data\raw\P-24\P02_02_1.png,1,2,2,0.6467205,1
+D:\software\vscode\TOXY\data\raw\P-24\P02_03_0.png,0,3,2,0.37901387,0
+D:\software\vscode\TOXY\data\raw\P-24\P02_04_1.png,1,4,2,0.66086435,1
+D:\software\vscode\TOXY\data\raw\P-24\P02_06_0.png,0,6,2,0.4615777,0
+D:\software\vscode\TOXY\data\raw\P-24\P02_07_1.png,1,7,2,0.64716846,1
+D:\software\vscode\TOXY\data\raw\P-24\P02_08_0.png,0,8,2,0.43851253,0
