@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+env/
+.venv/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Byte-compiled / optimized / DLL files
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Project outputs and models
+outputs/
+outputs/*
+outputs/**
+
+# PyTorch / checkpoints
+*.pth
+*.pt
+
+# Caches
+.cache/
+.pytest_cache/
+
+# Logs
+logs/

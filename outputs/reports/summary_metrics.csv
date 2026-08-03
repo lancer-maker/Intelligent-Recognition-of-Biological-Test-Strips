@@ -1,3 +1,0 @@
-patient_id,best_threshold,auc,accuracy,sensitivity,specificity
-1,0.6563434600830078,1.0,1.0,1.0,1.0
-2,0.6175774931907654,1.0,1.0,1.0,1.0
