@@ -1,16 +1,21 @@
 # 封装单次折叠（Single Fold）的两阶段训练循环、验证以及早停机制
 import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import numpy as np
+import pandas as pd
 from typing import Tuple, Optional
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from configs.load_config import get_main_config
+from src.utils.logger import get_logger
 from .train_utils import get_weighted_bce_loss, get_optimizer
 
 config = get_main_config().get("training", {})
+logger = get_logger()
 stage1_config = config.get("stage1", {})
 stage2_config = config.get("stage2", {})
 
@@ -48,6 +53,7 @@ class StageTrainer:
         phase2_lr: Optional[float] = None,
         weight_decay: Optional[float] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
+        self.loss_history = []
         """
         执行两阶段完整训练。
         
@@ -56,13 +62,15 @@ class StageTrainer:
         """
         phase1_epochs = phase1_epochs if phase1_epochs is not None else int(stage1_config.get("epochs", 20))
         phase2_epochs = phase2_epochs if phase2_epochs is not None else int(stage2_config.get("epochs", 10))
-        patience = patience if patience is not None else int(config.get("early_stopping_patience", 5))
+        patience = patience if patience is not None else config.get("early_stopping_patience")
+        if patience is not None:
+            patience = int(patience)
         phase1_lr = phase1_lr if phase1_lr is not None else float(stage1_config.get("learning_rate", 1e-4))
         phase2_lr = phase2_lr if phase2_lr is not None else float(stage2_config.get("learning_rate", 1e-5))
         weight_decay = weight_decay if weight_decay is not None else float(config.get("weight_decay", 1e-3))
 
         # ==================== 阶段一：冻结 2D 图像流 ====================
-        print(">>> Stage 1: Freezing 2D Stream (Training 1D CNN & Head) <<<")
+        logger.info("Stage 1: Freezing 2D Stream (Training 1D CNN & Head)")
         self.model.freeze_image_stream()
         optimizer1 = get_optimizer(self.model, lr=phase1_lr, weight_decay=weight_decay)
         self._run_epochs(
@@ -74,7 +82,7 @@ class StageTrainer:
         )
 
         # ==================== 阶段二：解冻全网络微调 ====================
-        print(">>> Stage 2: Unfreezing All Streams (Fine-tuning) <<<")
+        logger.info("Stage 2: Unfreezing All Streams (Fine-tuning)")
         self.model.unfreeze_image_stream()
         optimizer2 = get_optimizer(self.model, lr=phase2_lr, weight_decay=weight_decay) # 降低学习率
         best_preds, best_labels = self._run_epochs(
@@ -85,7 +93,27 @@ class StageTrainer:
             fold_info=fold_info,
         )
 
+        self._save_loss_history(fold_info=fold_info, report_dir="outputs/reports")
         return best_preds, best_labels
+
+    def _save_loss_history(self, fold_info: str = "", report_dir: Optional[str] = None):
+        """将训练过程中的 loss 记录保存到 reports 目录下的 CSV 文件。"""
+        if report_dir is None:
+            report_dir = Path(__file__).resolve().parents[2] / "outputs" / "reports"
+        else:
+            report_dir = Path(report_dir)
+
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        history_df = pd.DataFrame(self.loss_history)
+        if history_df.empty:
+            logger.warning("没有损失历史记录，跳过 CSV 导出。")
+            return
+
+        file_name = f"loss_history_{fold_info.replace('/', '_')}.csv" if fold_info else "loss_history.csv"
+        output_path = report_dir / file_name
+        history_df.to_csv(output_path, index=False)
+        logger.info("Saved loss history CSV: %s", output_path)
 
     def _run_epochs(
         self, 
@@ -148,12 +176,21 @@ class StageTrainer:
 
             # ------------------------------------------------
             # 实时更新外层 Epoch 进度条的尾部状态 (显示各 Loss 和 早停计数)
+            patience_status = "disabled" if patience is None else f"{patience_counter}/{patience}"
             epoch_pbar.set_postfix({
                 "t_loss": f"{train_loss:.4f}",
                 "v_loss": f"{val_loss:.4f}",
                 "best_v_loss": f"{best_val_loss:.4f}" if best_val_loss != float('inf') else "N/A",
-                "patience": f"{patience_counter}/{patience}"
+                "patience": patience_status
             })# ------------------------------------------------
+
+            self.loss_history.append({
+                "fold_info": fold_info,
+                "stage": stage_name,
+                "epoch": epoch,
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+            })
 
             # 3. 早停判断与模型保存
             if val_loss < best_val_loss:
@@ -164,10 +201,11 @@ class StageTrainer:
                 torch.save(self.model.state_dict(), os.path.join(self.save_dir, "best_model.pth"))
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
+                if patience is not None and patience_counter >= patience:
                     # ------------------------------------------------------
                     # 使用 tqdm.write 输出早停日志，避免砸乱进度条
                     tqdm.write(f"  ⚠️ {prefix}{stage_name} 触发早停 (Epoch {epoch}/{epochs})")
+                    logger.info("%s%s 触发早停 (Epoch %s/%s)", prefix, stage_name, epoch, epochs)
                     # ------------------------------------------------------
                     break
 

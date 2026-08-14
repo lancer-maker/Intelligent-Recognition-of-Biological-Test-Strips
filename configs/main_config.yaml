@@ -8,13 +8,13 @@ system:
   project_name: "immunoassay_strip_reader"
   seed: 42                       # 全局随机种子，确保实验可复现
   device: "cuda"                 # 'cuda' 或 'cpu'
-  num_workers: 4                 # DataLoader 多线程加载数
+  num_workers: 1                 # DataLoader 多线程加载数，正常设备上使用4及以上
 
 # 2. 数据配置
 data:
-  orig_csv_path: "D:\\software\\vscode\\TOXY\\data\\labels\\P\\labels.csv"      # 24例原始数据标注的具体文件路径
-  anon_csv_path: "D:\\software\\vscode\\TOXY\\data\\labels\\N\\labels.csv"     # 16例匿名增广标注
-  qc_image_dir: "data/raw/control_strips"               # 质控纸带目录 # 可能后续用不到这个判断模块
+  orig_csv_path: "data\\labels\\P\\labels.csv"      # 24例原始数据标注的具体文件路径
+  anon_csv_path: "data\\labels\\N\\labels.csv"     # 16例匿名增广标注
+  qc_image_dir: "data\\raw\\control_strips"               # 质控纸带目录 # 可能后续用不到这个判断模块
   standard_dpi_size: [220, 505]  # [Width, Height] 2D 物理 DPI 对齐尺寸
   proj_length: 512               # 1D 物理信号重采样点数
 
@@ -29,18 +29,18 @@ model:
 training:
   optimizer: "AdamW"
   weight_decay: 0.001            # 权重衰减 (L2 正则化)
-  early_stopping_patience: 5     # 验证集 Loss 连续不下降允许的最大 Epoch 数
+  early_stopping_patience: 8     # 验证集 Loss 连续不下降允许的最大 Epoch 数，null为关闭
   
   # 阶段一：冻结 EfficientNet，训练 1D CNN 和分类头
   stage1:
     epochs: 20
-    batch_size: 16
+    batch_size: 8                 # 笔记本上由16改为8
     learning_rate: 0.0001        # 1e-4
 
   # 阶段二：解冻 EfficientNet 全局微调
   stage2:
     epochs: 10
-    batch_size: 8
+    batch_size: 4                 # 笔记本上由8改为4
     learning_rate: 0.00001       # 1e-5
 
 # 5. 评估与阈值寻优策略配置

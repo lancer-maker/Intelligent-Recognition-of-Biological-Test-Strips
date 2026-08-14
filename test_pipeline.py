@@ -23,6 +23,7 @@ from src.data.transforms import get_train_transforms, get_val_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 from src.training.trainer import StageTrainer
 from src.evaluation.threshold_optimize import calculate_best_threshold, summarize_loocv_results
+from src.utils.logger import setup_logger
 
 
 def read_csv_directly(csv_path: str) -> pd.DataFrame:
@@ -79,8 +80,13 @@ def main(config_path: str = "configs/main_config.yaml"):
     # 2. 物理创建固定的输出目录
     ckpt_dir = cfg['output']['checkpoint_dir']
     report_dir = "outputs/reports"
+    log_dir = cfg['output'].get('log_dir', 'outputs/logs')
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(report_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    logger = setup_logger(os.path.join(log_dir, 'training.log'))
+    logger.info("训练开始，初始化日志输出和目录。")
 
     # 3. 直接读取 P 和 N 数据的标注 CSV
     project_root = Path(__file__).resolve().parent
@@ -102,7 +108,7 @@ def main(config_path: str = "configs/main_config.yaml"):
     # 获取 P 数据中的独立患者 ID 列表
     patient_ids = sorted(df_p['patient_id'].unique())
     num_folds = len(patient_ids)
-    print(f"🚀 开始 LOOCV 训练，自动检测到 {num_folds} 例样本，将执行 {num_folds} 折交叉验证...")
+    logger.info("开始 LOOCV 训练，自动检测到 %s 例样本，将执行 %s 折交叉验证...", num_folds, num_folds)
 
     fold_summaries = []
     all_predictions = []
