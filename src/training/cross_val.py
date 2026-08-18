@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from typing import Optional
 
 from src.data.dataset import TestStripDataset
-from src.data.transforms import get_train_transforms, get_val_transforms
+from src.data.transforms import get_train_transforms, get_val_transforms, get_projection_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 from src.training.trainer import StageTrainer
 
@@ -92,12 +92,14 @@ def run_loocv(
         train_ds = TestStripDataset(
             image_paths=train_df['filename'].tolist(),
             labels=train_df['label'].tolist(),
-            transforms=get_train_transforms()
+            transforms=get_train_transforms(),
+            projection_transforms=get_projection_transforms()
         )
         val_ds = TestStripDataset(
             image_paths=val_df['filename'].tolist(),
             labels=val_df['label'].tolist(),
-            transforms=get_val_transforms()
+            transforms=get_val_transforms(),
+            projection_transforms=get_projection_transforms()
         )
 
         train_loader = DataLoader(

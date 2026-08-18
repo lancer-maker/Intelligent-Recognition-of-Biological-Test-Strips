@@ -28,8 +28,8 @@ def parse_filename(filename: str):
 
 def main():
     # ========== 在这里直接修改路径 ==========
-    IMAGE_DIR = r"D:\\Learning\\work\\Intelligent-Recognition-of-Biological-Test-Strips\\data\\raw\\P-24"      # 图片所在文件夹
-    OUTPUT_CSV = r"D:\\Learning\\work\\Intelligent-Recognition-of-Biological-Test-Strips\\data\\labels\\P"  # 输出的CSV文件路径
+    IMAGE_DIR = r"data\\test\\raw"      # 图片所在文件夹
+    OUTPUT_CSV = r"data\test\labels"  # 输出的CSV文件路径
     # ====================================
 
     rows = []

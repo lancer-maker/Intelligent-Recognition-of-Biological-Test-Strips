@@ -3,6 +3,24 @@ import numpy as np
 import torch
 from typing import Tuple, Optional
 
+try:
+    from scipy.signal import detrend
+except ImportError:  # pragma: no cover
+    detrend = None
+
+
+def resize_to_standard_dpi(image_rgb: np.ndarray, target_size: Tuple[int, int] = (220, 505)) -> np.ndarray:
+    """将 RGB 图像统一到目标 DPI 尺寸，保留物理感知的插值策略。"""
+    if image_rgb.ndim != 3 or image_rgb.shape[-1] != 3:
+        raise ValueError(f"期望输入为 (H, W, 3) 的 RGB 图像，实际形状为 {image_rgb.shape}")
+
+    h, w = image_rgb.shape[:2]
+    target_w, target_h = target_size
+    if (w, h) != (target_w, target_h):
+        interpolation = cv2.INTER_CUBIC if w < target_w else cv2.INTER_AREA
+        return cv2.resize(image_rgb, (target_w, target_h), interpolation=interpolation)
+    return image_rgb
+
 
 def read_image_rgb(image_path: str, target_size: Optional[Tuple[int, int]] = (220, 505)) -> np.ndarray:
     """
@@ -12,20 +30,32 @@ def read_image_rgb(image_path: str, target_size: Optional[Tuple[int, int]] = (22
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         raise FileNotFoundError(f"无法读取图像文件: {image_path}")
-        
+
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    
+
     if target_size is not None:
-        h, w = img_rgb.shape[:2]
-        target_w, target_h = target_size
-        
-        # 如果尺寸不一致，选择物理感知更好的双三次插值 (INTER_CUBIC)
-        if (w, h) != (target_w, target_h):
-            # 低分辨率放大用 INTER_CUBIC，高分辨率缩小用 INTER_AREA
-            interpolation = cv2.INTER_CUBIC if w < target_w else cv2.INTER_AREA
-            img_rgb = cv2.resize(img_rgb, (target_w, target_h), interpolation=interpolation)
-            
+        img_rgb = resize_to_standard_dpi(img_rgb, target_size=target_size)
+
     return img_rgb
+
+
+def normalize_projection_baseline(signal: np.ndarray) -> np.ndarray:
+    """去基线：中心化并在存在漂移时去掉线性趋势，突出微弱波动。"""
+    signal = np.asarray(signal, dtype=np.float32)
+    if signal.size == 0:
+        return signal
+
+    # 先去均值，避免整体幅值主导卷积响应
+    centered = signal - np.mean(signal)
+
+    # 若可用 scipy，当信号存在线性漂移时进一步去趋势
+    if detrend is not None:
+        try:
+            centered = detrend(centered, type='linear', overwrite=False)
+        except TypeError:
+            centered = detrend(centered, type='linear')
+
+    return centered
 
 
 def extract_1d_projection_resampled(image_rgb_raw: np.ndarray, target_length: int = 512) -> torch.Tensor:
@@ -60,7 +90,10 @@ def extract_1d_projection_resampled(image_rgb_raw: np.ndarray, target_length: in
     else:
         resampled_proj = raw_proj_norm
 
-    # 5. 转为 Tensor 并增加 Channel 维 -> (1, target_length)
+    # 5. 去基线：让 1D CNN 关注波动，而不是整体幅值大小
+    resampled_proj = normalize_projection_baseline(resampled_proj)
+
+    # 6. 转为 Tensor 并增加 Channel 维 -> (1, target_length)
     proj_tensor = torch.from_numpy(resampled_proj).float().unsqueeze(0)
     
     return proj_tensor

@@ -29,7 +29,7 @@ model:
 training:
   optimizer: "AdamW"
   weight_decay: 0.001            # 权重衰减 (L2 正则化)
-  early_stopping_patience: 8     # 验证集 Loss 连续不下降允许的最大 Epoch 数，null为关闭
+  early_stopping_patience: 10     # 验证集 Loss 连续不下降允许的最大 Epoch 数，null为关闭
   
   # 阶段一：冻结 EfficientNet，训练 1D CNN 和分类头
   stage1:

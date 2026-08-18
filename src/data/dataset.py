@@ -9,12 +9,12 @@ from torch.utils.data import Dataset
 from configs.load_config import get_main_config
 
 try:
-    from .utils import extract_1d_projection_resampled
-    from .transforms import get_val_transforms
+    from .utils import extract_1d_projection_resampled, resize_to_standard_dpi
+    from .transforms import get_val_transforms, get_projection_transforms
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from data.utils import extract_1d_projection_resampled
-    from data.transforms import get_val_transforms
+    from data.utils import extract_1d_projection_resampled, resize_to_standard_dpi
+    from data.transforms import get_val_transforms, get_projection_transforms
 
 
 
@@ -32,12 +32,14 @@ class TestStripDataset(Dataset):
         image_paths: List[str],
         labels: List[int],
         transforms: Optional[Callable] = None,
+        projection_transforms: Optional[Callable] = None,
         standard_dpi_size: Optional[Tuple[int, int]] = None,  # 标准物理 DPI 像素尺寸
         proj_length: Optional[int] = None                     # 1D 物理重采样点数
     ):
         self.image_paths = image_paths
         self.labels = labels
         self.transforms = transforms if transforms is not None else get_val_transforms()
+        self.projection_transforms = projection_transforms if projection_transforms is not None else get_projection_transforms()
         self.standard_dpi_size = tuple(standard_dpi_size) if standard_dpi_size is not None else config_dpi_size
         self.proj_length = proj_length if proj_length is not None else config_proj_length
 
@@ -54,17 +56,14 @@ class TestStripDataset(Dataset):
             raise FileNotFoundError(f"无法读取文件: {image_path}")
         raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
 
-        # 2. 【1D流】基于原始图像提取投影，并线性重采样到固定物理采样点 512
-        proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=self.proj_length)
+        # 2. 【1D流】先对原始图像复制一份施加同样的颜色增强，再基于增强后的图像提取投影，并线性重采样到固定物理采样点 512
+        proj_image = raw_rgb.copy()
+        if self.projection_transforms is not None:
+            proj_image = self.projection_transforms(image=proj_image)['image']
+        proj_tensor = extract_1d_projection_resampled(proj_image, target_length=self.proj_length)
 
         # 3. 【2D流】将图像缩放到“标准 DPI 尺寸”(220, 505)，保证卷积核感受野物理一致
-        h, w = raw_rgb.shape[:2]
-        target_w, target_h = self.standard_dpi_size
-        if (w, h) != (target_w, target_h):
-            interp = cv2.INTER_CUBIC if w < target_w else cv2.INTER_AREA
-            dpi_aligned_rgb = cv2.resize(raw_rgb, (target_w, target_h), interpolation=interp)
-        else:
-            dpi_aligned_rgb = raw_rgb
+        dpi_aligned_rgb = resize_to_standard_dpi(raw_rgb, target_size=self.standard_dpi_size)
 
         # 4. 2D 图像增强与 ImageNet 归一化
         augmented = self.transforms(image=dpi_aligned_rgb)

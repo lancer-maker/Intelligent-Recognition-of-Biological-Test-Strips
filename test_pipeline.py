@@ -19,7 +19,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.dataset import TestStripDataset
-from src.data.transforms import get_train_transforms, get_val_transforms
+from src.data.transforms import get_train_transforms, get_val_transforms, get_projection_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 from src.training.trainer import StageTrainer
 from src.evaluation.threshold_optimize import calculate_best_threshold, summarize_loocv_results
@@ -133,6 +133,7 @@ def main(config_path: str = "configs/main_config.yaml"):
             image_paths=train_df['filename'].tolist(),
             labels=train_df['label'].tolist(),
             transforms=get_train_transforms(),
+            projection_transforms=get_projection_transforms(),
             standard_dpi_size=tuple(cfg['data']['standard_dpi_size']),
             proj_length=cfg['data']['proj_length']
         )
@@ -140,6 +141,7 @@ def main(config_path: str = "configs/main_config.yaml"):
             image_paths=val_df['filename'].tolist(),
             labels=val_df['label'].tolist(),
             transforms=get_val_transforms(),
+            projection_transforms=get_projection_transforms(),
             standard_dpi_size=tuple(cfg['data']['standard_dpi_size']),
             proj_length=cfg['data']['proj_length']
         )
