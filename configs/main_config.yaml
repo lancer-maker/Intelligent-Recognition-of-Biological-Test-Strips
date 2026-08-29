@@ -39,7 +39,7 @@ training:
 
   # 阶段二：解冻 EfficientNet 全局微调
   stage2:
-    epochs: 10
+    epochs: 15
     batch_size: 4                 # 笔记本上由8改为4
     learning_rate: 0.00001       # 1e-5
 

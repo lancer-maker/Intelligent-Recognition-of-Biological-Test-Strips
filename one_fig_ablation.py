@@ -25,8 +25,8 @@ from src.data.transforms import get_val_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 
 # ================= 配置区 =================
-IMAGE_PATH = "data/test/raw/N_026_1.jpg"        # 待分析图像（如漏检阳性样本）
-MODEL_WEIGHTS = "outputs/checkpoints/P24/best_model.pth"  # 某个模型权重
+IMAGE_PATH = r"data\test\raw\N_030_0.jpg"        # 待分析图像（如漏检阳性样本）
+MODEL_WEIGHTS = r"outputs\checkpoints\Tweak\finetuned_classifier.pth"  # 某个模型权重
 CONFIG_PATH = "configs/main_config.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================

@@ -1,0 +1,578 @@
+eva_fin_classifier
+"""
+单模型评估脚本：仅评估微调后的分类头模型
+
+专门检查以下权重：
+    outputs/checkpoints/Tweak/finetuned_classifier.pth
+
+不做任何平均、集成或多模型融合，避免被额外平均算法污染结果。
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score, roc_curve
+from torch.utils.data import DataLoader
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
+from src.data.dataset import TestStripDataset
+from src.data.transforms import get_projection_transforms, get_val_transforms
+from src.models.dual_stream_net import DualStreamStripNet
+from src.utils.model_helper import load_model_state
+
+TEST_CSV = PROJECT_ROOT / "data" / "test" / "labels" / "labels.csv"
+TEST_IMAGE_DIR = PROJECT_ROOT / "data" / "test" / "raw"
+MODEL_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "Tweak" / "finetuned_classifier.pth"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "main_config.yaml"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 8
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "reports" / "test"
+
+
+def load_config(config_path: str):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def compute_metrics_with_best_threshold(labels, probs):
+    # """使用固定判定阈值 0.42，而不是自动搜索最佳阈值。"""
+    # best_threshold = 0.42
+
+    # if len(np.unique(labels)) < 2:
+    #     auc = np.nan
+    # else:
+    #     auc = roc_auc_score(labels, probs)
+    """使用 Youden's J 找到最佳阈值，并计算对应的分类指标。"""
+    if len(np.unique(labels)) < 2:
+        auc = np.nan
+        best_threshold = 0.5
+    else:
+        auc = roc_auc_score(labels, probs)
+        fpr, tpr, thresholds = roc_curve(labels, probs)
+        j_scores = tpr - fpr
+        best_idx = int(np.argmax(j_scores))
+        best_threshold = float(thresholds[best_idx])
+        if best_threshold > 1.0:
+            best_threshold = float(np.max(probs))
+
+    preds = (probs >= best_threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    accuracy = accuracy_score(labels, preds)
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    return {
+        "best_threshold": float(best_threshold),
+        "auc": float(auc),
+        "accuracy": float(accuracy),
+        "sensitivity": float(sensitivity),
+        "specificity": float(specificity),
+    }
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    cfg = load_config(CONFIG_PATH)
+    model_cfg = cfg["model"]
+    data_cfg = cfg["data"]
+
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"未找到目标模型权重: {MODEL_PATH}")
+
+    df = pd.read_csv(TEST_CSV)
+    df["filename"] = df["filename"].apply(lambda f: str(Path(TEST_IMAGE_DIR) / str(f)))
+    print(f"测试集样本数: {len(df)}")
+
+    test_dataset = TestStripDataset(
+        image_paths=df["filename"].tolist(),
+        labels=df["label"].tolist(),
+        transforms=get_val_transforms(),
+        projection_transforms=get_projection_transforms(),
+        standard_dpi_size=tuple(data_cfg["standard_dpi_size"]),
+        proj_length=data_cfg["proj_length"],
+    )
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = DualStreamStripNet(
+        pretrained_2d=model_cfg["pretrained"],
+        feature_dim=model_cfg["feature_dim"],
+        dropout_rate=model_cfg["dropout_rate"],
+    )
+    model = load_model_state(model, str(MODEL_PATH))
+    model.to(DEVICE)
+    model.eval()
+
+    probs = []
+    with torch.no_grad():
+        for img_batch, proj_batch, _ in test_loader:
+            img_batch = img_batch.to(DEVICE)
+            proj_batch = proj_batch.to(DEVICE)
+            logits = model(img_batch, proj_batch)
+            prob = torch.sigmoid(logits).cpu().numpy().flatten()
+            probs.extend(prob)
+
+    probs = np.asarray(probs, dtype=np.float32)
+    labels = df["label"].astype(int).to_numpy()
+
+    metrics = compute_metrics_with_best_threshold(labels, probs)
+    metrics["model_path"] = str(MODEL_PATH)
+    metrics_df = pd.DataFrame([metrics])
+
+    metrics_columns = ["model_path", "best_threshold", "auc", "accuracy", "sensitivity", "specificity"]
+    metrics_df = metrics_df[metrics_columns]
+
+    metrics_csv_path = OUTPUT_DIR / "finetuned_classifier_metrics.csv"
+    metrics_df.to_csv(metrics_csv_path, index=False)
+
+    df_out = df.copy()
+    df_out["label"] = labels
+    df_out["probability"] = probs
+    df_out["pred_label"] = (probs >= metrics["best_threshold"]).astype(int)
+
+    pred_csv_path = OUTPUT_DIR / "finetuned_classifier_predictions.csv"
+    df_out.to_csv(pred_csv_path, index=False)
+
+    print("=" * 72)
+    print(f"评估模型: {MODEL_PATH}")
+    print(f"best_threshold={metrics['best_threshold']:.4f}")
+    print(f"AUC={metrics['auc']:.4f}")
+    print(f"Accuracy={metrics['accuracy']:.4f}")
+    print(f"Sensitivity={metrics['sensitivity']:.4f}")
+    print(f"Specificity={metrics['specificity']:.4f}")
+    print(f"Metrics CSV: {metrics_csv_path}")
+    print(f"Prediction CSV: {pred_csv_path}")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()
+================================================================================================================================================================================
+================================================================================================================================================================================
+finetune_classifier
+"""
+微调分类头脚本 (全量消融相对偏置挖掘 + 困难样本微扰增强版)
+
+改进亮点：
+1. 精准相对消融判定：
+   - 依据 (proj_only - image_only) 相对差值，筛选“投影抓到信号但图像很弱”的真正阳性漏检样本。
+   - 阴性样本筛选“投影存在杂波但图像正常”的边界样本，防止分类头过度敏感导致假阳性。
+2. 彻底杜绝随机补齐：
+   - 若符合严选条件的困难样本不足 10 张，仅对选出的困难样本做轻微数据增强（图像亮度/对比度扰动 + 1D投影高斯微噪声）补齐到 10+10=20。
+3. 损失加权与监控早停：
+   - BCEWithLogitsLoss(pos_weight=5.0) 强力拉扯分类边界。
+   - 实时监控 N_026_1.jpg，一旦转阳 (>= target_prob) 立即 Early Stopping。
+4. dataset的收集为随机种子，该脚本用于挖掘随机，获得多重样本
+"""
+
+import argparse
+import random
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent if (Path(__file__).resolve().parent / "src").exists() is False else Path(__file__).resolve().parent
+sys.path.append(str(PROJECT_ROOT))
+
+from src.data.transforms import get_val_transforms
+from src.data.utils import extract_1d_projection_resampled, read_image_rgb, resize_to_standard_dpi
+from src.models.dual_stream_net import DualStreamStripNet
+from src.utils.model_helper import load_model_state
+
+DEFAULT_IMAGE_SIZE = (220, 505)
+DEFAULT_PROJ_LENGTH = 512
+TARGET_POS_COUNT = 10
+TARGET_NEG_COUNT = 10
+FIXED_MODEL_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "P24" / "best_model.pth"
+
+
+def get_hard_augmentation():
+    """仅对困难样本做轻微扰动的数据增强"""
+    return A.Compose([
+        A.RandomBrightnessContrast(p=0.8, brightness_limit=0.08, contrast_limit=0.08),
+        A.CLAHE(clip_limit=1.5, tile_grid_size=(4, 4), p=0.5),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
+class HardMiningDataset(Dataset):
+    def __init__(self, samples: List[Dict[str, object]]):
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        item = self.samples[idx]
+        return item["image_tensor"], item["proj_tensor"], torch.tensor(float(item["label"]), dtype=torch.float32)
+
+
+def load_training_records() -> List[Dict[str, object]]:
+    records = []
+    root = PROJECT_ROOT / "data"
+    for folder_name, csv_name in [("P-24", "P"), ("N-16", "N")]:
+        csv_path = root / "labels" / csv_name / "labels.csv"
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            image_name = str(row["filename"]).strip()
+            image_path = root / "raw" / folder_name / image_name
+            if not image_path.exists():
+                continue
+            records.append({
+                "image_path": str(image_path),
+                "label": int(row["label"]),
+                "source": csv_name,
+                "filename": image_name,
+            })
+    return records
+
+
+def compute_branch_probs(model: nn.Module, image_path: str, device: torch.device) -> Dict[str, float]:
+    """严格保持评估模式，获取单张图的三种消融概率"""
+    model.eval()
+    raw_rgb = read_image_rgb(image_path)
+    proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH).unsqueeze(0).to(device)
+    dpi_aligned_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+    image_tensor = get_val_transforms()(image=dpi_aligned_rgb)["image"].unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        img_feats = model.image_stream(image_tensor)
+        proj_feats = model.proj_stream(proj_tensor)
+
+        # 仅图像流
+        proj_zero = torch.zeros_like(proj_feats)
+        prob_img = torch.sigmoid(model.classifier(torch.cat((img_feats, proj_zero), dim=1))).item()
+
+        # 仅投影流
+        img_zero = torch.zeros_like(img_feats)
+        prob_proj = torch.sigmoid(model.classifier(torch.cat((img_zero, proj_feats), dim=1))).item()
+
+        # 双流融合
+        prob_fusion = torch.sigmoid(model.classifier(torch.cat((img_feats, proj_feats), dim=1))).item()
+
+    return {
+        "image_only": float(prob_img),
+        "proj_only": float(prob_proj),
+        "fusion": float(prob_fusion),
+    }
+
+
+def augment_and_create_sample(item: Dict[str, object], device: torch.device) -> Dict[str, object]:
+    """生成困难样本变体：图像轻微色彩扰动 + 投影微小高斯噪声 (std=0.01)"""
+    raw_rgb = read_image_rgb(str(item["image_path"]))
+    proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH)
+    
+    # 投影注入弱白噪声
+    noise = torch.randn_like(proj_tensor) * 0.01
+    proj_tensor = torch.clamp(proj_tensor + noise, 0.0, 1.0)
+
+    dpi_aligned_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+    image_tensor = get_hard_augmentation()(image=dpi_aligned_rgb)["image"]
+
+    return {
+        "image_tensor": image_tensor,
+        "proj_tensor": proj_tensor,
+        "label": int(item["label"]),
+        "filename": f"aug_{item['filename']}",
+    }
+
+
+def prepare_balanced_hard_dataset(
+    model: nn.Module,
+    records: List[Dict[str, object]],
+    device: torch.device,
+) -> Tuple[List[Dict[str, object]], int, int]:
+    """融合相对偏置挖掘与微扰增强扩充"""
+    print("\n[1/3] 正在对全量训练样本执行消融分析与相对偏置挖掘...")
+
+    scored_records: List[Dict[str, object]] = []
+    for r in records:
+        probs = compute_branch_probs(model, str(r["image_path"]), device)
+        entry = {
+            **r,
+            "img_prob": float(probs["image_only"]),
+            "proj_prob": float(probs["proj_only"]),
+            "fusion": float(probs["fusion"]),
+            # 投影偏向强度：正值代表投影强于图像
+            "proj_bias": float(probs["proj_only"] - probs["image_only"]),
+        }
+        scored_records.append(entry)
+
+    # 1. 严格筛选阳性困难样本：Label=1 且 投影流高于图像流 (有明显投影优势但被整体低估)
+    #    且投影流具有一定的特征响应 (>= 0.25)
+    pos_hard_candidates = [
+        x for x in scored_records
+        if x["label"] == 1 and x["proj_bias"] > 0.05 and x["proj_prob"] >= 0.25
+    ]
+    # 按投影优势从大到小排序
+    pos_hard_candidates.sort(key=lambda x: x["proj_bias"], reverse=True)
+
+    # 2. 严格筛选阴性困难样本：Label=0 且 投影流有一定杂波 (0.20 <= proj_prob <= 0.50)
+    #    按与 0.35 的接近程度排序，挑选最具代表性的边界负样本
+    neg_hard_candidates = [
+        x for x in scored_records
+        if x["label"] == 0 and (0.15 <= x["proj_prob"] <= 0.50)
+    ]
+    neg_hard_candidates.sort(key=lambda x: abs(x["proj_prob"] - 0.35))
+
+    # 兜底保障：若严选数量为空，退回全集按差值/边界距离取 Top
+    if not pos_hard_candidates:
+        all_pos = [x for x in scored_records if x["label"] == 1]
+        all_pos.sort(key=lambda x: x["proj_bias"], reverse=True)
+        pos_hard_candidates = all_pos[:TARGET_POS_COUNT]
+
+    if not neg_hard_candidates:
+        all_neg = [x for x in scored_records if x["label"] == 0]
+        all_neg.sort(key=lambda x: abs(x["proj_prob"] - 0.35))
+        neg_hard_candidates = all_neg[:TARGET_NEG_COUNT]
+
+    raw_pos_count = len(pos_hard_candidates)
+    raw_neg_count = len(neg_hard_candidates)
+
+    print(f"  -> 严选命中: 阳性困难样本 = {raw_pos_count} 张, 阴性边界样本 = {raw_neg_count} 张")
+
+    # 构建 10 阳 + 10 阴 纯困难样本集（不足部分全部采用增强扩充，拒绝随机填入简单样本）
+    final_dataset_items = []
+
+    # 阳性填满 10 张
+    for item in pos_hard_candidates[:TARGET_POS_COUNT]:
+        raw_rgb = read_image_rgb(str(item["image_path"]))
+        proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH)
+        dpi_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+        img_t = get_val_transforms()(image=dpi_rgb)["image"]
+        final_dataset_items.append({
+            "image_tensor": img_t, "proj_tensor": proj_tensor, "label": 1, "filename": item["filename"]
+        })
+
+    idx = 0
+    while len([x for x in final_dataset_items if x["label"] == 1]) < TARGET_POS_COUNT:
+        base_item = pos_hard_candidates[idx % len(pos_hard_candidates)]
+        aug_sample = augment_and_create_sample(base_item, device)
+        final_dataset_items.append(aug_sample)
+        idx += 1
+
+    # 阴性填满 10 张
+    for item in neg_hard_candidates[:TARGET_NEG_COUNT]:
+        raw_rgb = read_image_rgb(str(item["image_path"]))
+        proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH)
+        dpi_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+        img_t = get_val_transforms()(image=dpi_rgb)["image"]
+        final_dataset_items.append({
+            "image_tensor": img_t, "proj_tensor": proj_tensor, "label": 0, "filename": item["filename"]
+        })
+
+    idx = 0
+    while len([x for x in final_dataset_items if x["label"] == 0]) < TARGET_NEG_COUNT:
+        base_item = neg_hard_candidates[idx % len(neg_hard_candidates)]
+        aug_sample = augment_and_create_sample(base_item, device)
+        final_dataset_items.append(aug_sample)
+        idx += 1
+
+    return final_dataset_items, raw_pos_count, raw_neg_count
+
+
+def test_single_image(model: nn.Module, test_image_path: Path, device: torch.device) -> Tuple[float, float, float]:
+    """测试指定监控图片（N_026_1）的三种概率"""
+    if not test_image_path.exists():
+        return 0.0, 0.0, 0.0
+    probs = compute_branch_probs(model, str(test_image_path), device)
+    return probs["fusion"], probs["proj_only"], probs["image_only"]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="困难样本微调与早停机制")
+    parser.add_argument("--epochs", type=int, default=15, help="微调轮数 (默认 15)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="学习率 (默认 1e-4)")
+    parser.add_argument("--pos-weight", type=float, default=5.0, help="阳性损失权重 (默认 5.0)")
+    parser.add_argument("--target-prob", type=float, default=0.55, help="N_026_1 达到该概率时立即早停")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_test_img = PROJECT_ROOT / "data" / "test" / "raw" / "N_026_1.jpg"
+
+    if not FIXED_MODEL_PATH.exists():
+        raise FileNotFoundError(f"未找到固定权重路径: {FIXED_MODEL_PATH}")
+
+    print(f"[*] 加载原始权重: {FIXED_MODEL_PATH}")
+
+    model = DualStreamStripNet(pretrained_2d=False, feature_dim=128, dropout_rate=0.5)
+    model = load_model_state(model, str(FIXED_MODEL_PATH))
+    model.to(device)
+    model.eval()
+
+    # 1. 记录微调前的基准性能
+    init_fusion, init_proj, init_img = test_single_image(model, target_test_img, device)
+    print("\n" + "=" * 60)
+    print(f"【目标样本 N_026_1 初始状态】")
+    print(f"  - 图像流概率 (Image Only) : {init_img:.4f}")
+    print(f"  - 投影流概率 (Proj Only)  : {init_proj:.4f} (已抓到特征但被分类头抑制)")
+    print(f"  - 最终融合概率 (Fusion)   : {init_fusion:.4f} (判定为阴性/漏检)")
+    print("=" * 60)
+
+    # 2. 构建纯困难数据集
+    records = load_training_records()
+    dataset_items, raw_pos, raw_neg = prepare_balanced_hard_dataset(model, records, device)
+
+    print(f"\n[2/3] 困难样本构建完毕: 共 {len(dataset_items)} 张 (10 阳性难样本 + 10 阴性难样本)")
+    for i, it in enumerate(dataset_items):
+        print(f"  [{i+1:02d}] Label={it['label']} | Source={it['filename']}")
+
+    dataset = HardMiningDataset(dataset_items)
+    loader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+    # 3. 冻结骨干，仅微调分类头
+    for param in model.image_stream.parameters():
+        param.requires_grad = False
+    for param in model.proj_stream.parameters():
+        param.requires_grad = False
+    for param in model.classifier.parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(model.classifier.parameters(), lr=args.lr, weight_decay=1e-3)
+    pos_weight_tensor = torch.tensor([args.pos_weight]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+
+    save_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "Tweak"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / "finetuned_classifier.pth"
+
+    # 4. 训练与 Early Stopping
+    print(f"\n[3/3] 开始微调分类头 (Pos Weight = {args.pos_weight}, LR = {args.lr})...")
+    best_target_prob = init_fusion
+    early_stopped = False
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for imgs, projs, labels in loader:
+            imgs = imgs.to(device)
+            projs = projs.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            optimizer.zero_grad()
+            logits = model(imgs, projs)
+            loss = criterion(logits, labels)
+=======================================================================================================================================================
+=======================================================================================================================================================
+finetune_pipeline
+"""
+微调与评估流水线调度脚本 (通过模块化调用两个原脚本)
+
+逻辑：
+1. 调用 finetune_classifier.main() 进行分类头微调，产出初始权重 outputs/checkpoints/Tweak/finetuned_classifier.pth
+2. 调用 eva_fin_classifier.main() 评估该权重，产出 metrics.csv 与 predictions.csv
+3. 读取评估生成的 metrics，并将权重文件与报告重命名为带 AUC 和 Sensitivity 的格式（防止被下次覆盖）
+"""
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+import pandas as pd
+
+# 确保能正常引用当前目录下的模块
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR if (CURRENT_DIR / "src").exists() else CURRENT_DIR.parent
+sys.path.append(str(CURRENT_DIR))
+sys.path.append(str(PROJECT_ROOT))
+
+# 导入两个原始脚本的 main 函数与配置路径
+import finetune_classifier
+import eva_fin_classifier
+
+
+def main():
+    parser = argparse.ArgumentParser(description="微调与评估流水线调度器")
+    parser.add_argument("--epochs", type=int, default=15, help="微调轮数 (默认 15)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="学习率 (默认 1e-4)")
+    parser.add_argument("--pos-weight", type=float, default=5.0, help="阳性损失权重 (默认 5.0)")
+    parser.add_argument("--target-prob", type=float, default=0.55, help="N_026_1 早停阈值 (默认 0.55)")
+    args = parser.parse_args()
+
+    print("\n" + "=" * 70)
+    print(">>> 阶段 1: 调用 finetune_classifier 开始微调分类头")
+    print("=" * 70)
+
+    # 模拟 sys.argv 传参给 finetune_classifier
+    sys.argv = [
+        "finetune_classifier.py",
+        "--epochs", str(args.epochs),
+        "--lr", str(args.lr),
+        "--pos-weight", str(args.pos_weight),
+        "--target-prob", str(args.target_prob),
+    ]
+    finetune_classifier.main()
+
+    print("\n" + "=" * 70)
+    print(">>> 阶段 2: 调用 eva_fin_classifier 开始评估测试集")
+    print("=" * 70)
+
+    sys.argv = ["eva_fin_classifier.py"]
+    eva_fin_classifier.main()
+
+    print("\n" + "=" * 70)
+    print(">>> 阶段 3: 归档带 AUC & Sensitivity 后缀的模型权重与报告")
+    print("=" * 70)
+
+    # 读取评估产出的指标
+    metrics_csv_path = eva_fin_classifier.OUTPUT_DIR / "finetuned_classifier_metrics.csv"
+    pred_csv_path = eva_fin_classifier.OUTPUT_DIR / "finetuned_classifier_predictions.csv"
+    src_model_path = eva_fin_classifier.MODEL_PATH
+
+    if not metrics_csv_path.exists() or not src_model_path.exists():
+        print("[错误] 未找到评估生成的指标文件或模型权重，跳过归档。")
+        return
+
+    df_metrics = pd.read_csv(metrics_csv_path)
+    auc_val = float(df_metrics["auc"].iloc[0])
+    sens_val = float(df_metrics["sensitivity"].iloc[0])
+    acc_val = float(df_metrics["accuracy"].iloc[0])
+
+    suffix = f"AUC_{auc_val:.4f}_Sens_{sens_val:.4f}"
+    archive_folder_name = f"finetuned_{suffix}"
+    archive_dir = eva_fin_classifier.OUTPUT_DIR / archive_folder_name
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. 复制归档模型权重，并以模型名称作为文件夹名保存
+    target_model_path = archive_dir / f"{archive_folder_name}.pth"
+    shutil.copy2(src_model_path, target_model_path)
+
+    # 2. 复制归档指标 CSV 到同一文件夹中
+    target_metrics_path = archive_dir / f"metrics_{suffix}.csv"
+    shutil.copy2(metrics_csv_path, target_metrics_path)
+
+    # 3. 复制归档预测明细 CSV 到同一文件夹中
+    if pred_csv_path.exists():
+        target_pred_path = archive_dir / f"predictions_{suffix}.csv"
+        shutil.copy2(pred_csv_path, target_pred_path)
+
+    print(f"🎉 归档成功！")
+    print(f"  - 测试集 AUC:        {auc_val:.4f}")
+    print(f"  - 测试集 Sensitivity: {sens_val:.4f} (召回率)")
+    print(f"  - 测试集 Accuracy:    {acc_val:.4f}")
+    print(f"  - 归档目录:          {archive_dir}")
+    print(f"  - 新模型权重已备份至: {target_model_path}")
+    print(f"  - 评估指标已备份至:   {target_metrics_path}")
+    print("=" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    main()

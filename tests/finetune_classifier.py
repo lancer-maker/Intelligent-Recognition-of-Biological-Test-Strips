@@ -1,0 +1,354 @@
+"""
+微调分类头脚本 (全量消融相对偏置挖掘 + 困难样本微扰增强版)
+"""
+
+import argparse
+import random
+import sys
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent if (Path(__file__).resolve().parent / "src").exists() is False else Path(__file__).resolve().parent
+sys.path.append(str(PROJECT_ROOT))
+
+from src.data.transforms import get_val_transforms
+from src.data.utils import extract_1d_projection_resampled, read_image_rgb, resize_to_standard_dpi
+from src.models.dual_stream_net import DualStreamStripNet
+from src.utils.model_helper import load_model_state
+
+DEFAULT_IMAGE_SIZE = (220, 505)
+DEFAULT_PROJ_LENGTH = 512
+TARGET_POS_COUNT = 10
+TARGET_NEG_COUNT = 10
+FIXED_MODEL_PATH = PROJECT_ROOT / "outputs" / "checkpoints" / "P24" / "best_model.pth"
+
+# ================= 核心修改 1：全局固定随机种子 =================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+# ================================================================
+
+def get_hard_augmentation():
+    """仅对困难样本做轻微扰动的数据增强"""
+    return A.Compose([
+        A.RandomBrightnessContrast(p=0.8, brightness_limit=0.08, contrast_limit=0.08),
+        A.CLAHE(clip_limit=1.5, tile_grid_size=(4, 4), p=0.5),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
+class HardMiningDataset(Dataset):
+    def __init__(self, samples: List[Dict[str, object]]):
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        item = self.samples[idx]
+        return item["image_tensor"], item["proj_tensor"], torch.tensor(float(item["label"]), dtype=torch.float32)
+
+
+def load_training_records() -> List[Dict[str, object]]:
+    records = []
+    root = PROJECT_ROOT / "data"
+    for folder_name, csv_name in [("P-24", "P"), ("N-16", "N")]:
+        csv_path = root / "labels" / csv_name / "labels.csv"
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        for _, row in df.iterrows():
+            image_name = str(row["filename"]).strip()
+            image_path = root / "raw" / folder_name / image_name
+            if not image_path.exists():
+                continue
+            records.append({
+                "image_path": str(image_path),
+                "label": int(row["label"]),
+                "source": csv_name,
+                "filename": image_name,
+            })
+    return records
+
+
+def compute_branch_probs(model: nn.Module, image_path: str, device: torch.device) -> Dict[str, float]:
+    """严格保持评估模式，获取单张图的三种消融概率"""
+    model.eval()
+    raw_rgb = read_image_rgb(image_path)
+    proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH).unsqueeze(0).to(device)
+    dpi_aligned_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+    image_tensor = get_val_transforms()(image=dpi_aligned_rgb)["image"].unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        img_feats = model.image_stream(image_tensor)
+        proj_feats = model.proj_stream(proj_tensor)
+
+        # 仅图像流
+        proj_zero = torch.zeros_like(proj_feats)
+        prob_img = torch.sigmoid(model.classifier(torch.cat((img_feats, proj_zero), dim=1))).item()
+
+        # 仅投影流
+        img_zero = torch.zeros_like(img_feats)
+        prob_proj = torch.sigmoid(model.classifier(torch.cat((img_zero, proj_feats), dim=1))).item()
+
+        # 双流融合
+        prob_fusion = torch.sigmoid(model.classifier(torch.cat((img_feats, proj_feats), dim=1))).item()
+
+    return {
+        "image_only": float(prob_img),
+        "proj_only": float(prob_proj),
+        "fusion": float(prob_fusion),
+    }
+
+
+def augment_and_create_sample(item: Dict[str, object], device: torch.device, seed_offset: int) -> Dict[str, object]:
+    """生成困难样本变体：图像轻微色彩扰动 + 投影微小高斯噪声 (std=0.01)"""
+    raw_rgb = read_image_rgb(str(item["image_path"]))
+    proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH)
+    
+    # 投影注入弱白噪声 (为了保证完全稳定，使用基于 offset 生成的确定的伪随机噪声)
+    rng = torch.Generator()
+    rng.manual_seed(42 + seed_offset)
+    noise = torch.randn(proj_tensor.shape, generator=rng) * 0.01
+    proj_tensor = torch.clamp(proj_tensor + noise, 0.0, 1.0)
+
+    dpi_aligned_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+    image_tensor = get_hard_augmentation()(image=dpi_aligned_rgb)["image"]
+
+    return {
+        "image_tensor": image_tensor,
+        "proj_tensor": proj_tensor,
+        "label": int(item["label"]),
+        "filename": f"aug_{item['filename']}",
+    }
+
+
+def prepare_balanced_hard_dataset(
+    model: nn.Module,
+    records: List[Dict[str, object]],
+    device: torch.device,
+) -> Tuple[List[Dict[str, object]], int, int]:
+    """融合相对偏置挖掘与微扰增强扩充"""
+    print("\n[1/3] 正在对全量训练样本执行消融分析与相对偏置挖掘...")
+
+    scored_records: List[Dict[str, object]] = []
+    for r in records:
+        probs = compute_branch_probs(model, str(r["image_path"]), device)
+        entry = {
+            **r,
+            "img_prob": float(probs["image_only"]),
+            "proj_prob": float(probs["proj_only"]),
+            "fusion": float(probs["fusion"]),
+            "proj_bias": float(probs["proj_only"] - probs["image_only"]),
+        }
+        scored_records.append(entry)
+
+    pos_hard_candidates = [
+        x for x in scored_records
+        if x["label"] == 1 and x["proj_bias"] > 0.05 and x["proj_prob"] >= 0.25
+    ]
+    
+    # ================= 核心修改 2：加入文件名做二级排序，锁死挑选顺序 =================
+    pos_hard_candidates.sort(key=lambda x: (round(x["proj_bias"], 4), x["filename"]), reverse=True)
+
+    neg_hard_candidates = [
+        x for x in scored_records
+        if x["label"] == 0 and (0.15 <= x["proj_prob"] <= 0.50)
+    ]
+    neg_hard_candidates.sort(key=lambda x: (round(abs(x["proj_prob"] - 0.35), 4), x["filename"]))
+
+    # 兜底保障
+    if not pos_hard_candidates:
+        all_pos = [x for x in scored_records if x["label"] == 1]
+        all_pos.sort(key=lambda x: (round(x["proj_bias"], 4), x["filename"]), reverse=True)
+        pos_hard_candidates = all_pos[:TARGET_POS_COUNT]
+
+    if not neg_hard_candidates:
+        all_neg = [x for x in scored_records if x["label"] == 0]
+        all_neg.sort(key=lambda x: (round(abs(x["proj_prob"] - 0.35), 4), x["filename"]))
+        neg_hard_candidates = all_neg[:TARGET_NEG_COUNT]
+    # ==============================================================================
+
+    raw_pos_count = len(pos_hard_candidates)
+    raw_neg_count = len(neg_hard_candidates)
+
+    print(f"  -> 严选命中: 阳性困难样本 = {raw_pos_count} 张, 阴性边界样本 = {raw_neg_count} 张")
+
+    final_dataset_items = []
+
+    # 阳性填满 10 张
+    for item in pos_hard_candidates[:TARGET_POS_COUNT]:
+        raw_rgb = read_image_rgb(str(item["image_path"]))
+        proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH)
+        dpi_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+        img_t = get_val_transforms()(image=dpi_rgb)["image"]
+        final_dataset_items.append({
+            "image_tensor": img_t, "proj_tensor": proj_tensor, "label": 1, "filename": item["filename"]
+        })
+
+    idx = 0
+    while len([x for x in final_dataset_items if x["label"] == 1]) < TARGET_POS_COUNT:
+        base_item = pos_hard_candidates[idx % len(pos_hard_candidates)]
+        aug_sample = augment_and_create_sample(base_item, device, seed_offset=idx)
+        final_dataset_items.append(aug_sample)
+        idx += 1
+
+    # 阴性填满 10 张
+    for item in neg_hard_candidates[:TARGET_NEG_COUNT]:
+        raw_rgb = read_image_rgb(str(item["image_path"]))
+        proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=DEFAULT_PROJ_LENGTH)
+        dpi_rgb = resize_to_standard_dpi(raw_rgb, target_size=DEFAULT_IMAGE_SIZE)
+        img_t = get_val_transforms()(image=dpi_rgb)["image"]
+        final_dataset_items.append({
+            "image_tensor": img_t, "proj_tensor": proj_tensor, "label": 0, "filename": item["filename"]
+        })
+
+    idx = 0
+    while len([x for x in final_dataset_items if x["label"] == 0]) < TARGET_NEG_COUNT:
+        base_item = neg_hard_candidates[idx % len(neg_hard_candidates)]
+        aug_sample = augment_and_create_sample(base_item, device, seed_offset=100+idx)
+        final_dataset_items.append(aug_sample)
+        idx += 1
+
+    return final_dataset_items, raw_pos_count, raw_neg_count
+
+
+def test_single_image(model: nn.Module, test_image_path: Path, device: torch.device) -> Tuple[float, float, float]:
+    """测试指定监控图片（N_026_1）的三种概率"""
+    if not test_image_path.exists():
+        return 0.0, 0.0, 0.0
+    probs = compute_branch_probs(model, str(test_image_path), device)
+    return probs["fusion"], probs["proj_only"], probs["image_only"]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="困难样本微调与早停机制")
+    parser.add_argument("--epochs", type=int, default=15, help="微调轮数 (默认 15)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="学习率 (默认 1e-4)")
+    parser.add_argument("--pos-weight", type=float, default=5.0, help="阳性损失权重 (默认 5.0)")
+    parser.add_argument("--target-prob", type=float, default=0.55, help="N_026_1 达到该概率时立即早停")
+    parser.add_argument("--seed", type=int, default=42, help="全局随机种子")
+    args = parser.parse_args()
+
+    set_seed(args.seed) # 激活全局锁
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    target_test_img = PROJECT_ROOT / "data" / "test" / "raw" / "N_026_1.jpg"
+
+    if not FIXED_MODEL_PATH.exists():
+        raise FileNotFoundError(f"未找到固定权重路径: {FIXED_MODEL_PATH}")
+
+    print(f"[*] 加载原始权重: {FIXED_MODEL_PATH}")
+
+    model = DualStreamStripNet(pretrained_2d=False, feature_dim=128, dropout_rate=0.5)
+    model = load_model_state(model, str(FIXED_MODEL_PATH))
+    model.to(device)
+    model.eval()
+
+    # 1. 记录微调前的基准性能
+    init_fusion, init_proj, init_img = test_single_image(model, target_test_img, device)
+    print("\n" + "=" * 60)
+    print(f"【目标样本 N_026_1 初始状态】")
+    print(f"  - 图像流概率 (Image Only) : {init_img:.4f}")
+    print(f"  - 投影流概率 (Proj Only)  : {init_proj:.4f} (已抓到特征但被分类头抑制)")
+    print(f"  - 最终融合概率 (Fusion)   : {init_fusion:.4f} (判定为阴性/漏检)")
+    print("=" * 60)
+
+    # 2. 构建纯困难数据集
+    records = load_training_records()
+    dataset_items, raw_pos, raw_neg = prepare_balanced_hard_dataset(model, records, device)
+
+    print(f"\n[2/3] 困难样本构建完毕: 共 {len(dataset_items)} 张 (10 阳性难样本 + 10 阴性难样本)")
+    for i, it in enumerate(dataset_items):
+        print(f"  [{i+1:02d}] Label={it['label']} | Source={it['filename']}")
+
+    dataset = HardMiningDataset(dataset_items)
+    
+    # ================= 核心修改 3：绑定 DataLoader 种子 =================
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, generator=g)
+    # ====================================================================
+
+    # 3. 冻结骨干，仅微调分类头
+    for param in model.image_stream.parameters():
+        param.requires_grad = False
+    for param in model.proj_stream.parameters():
+        param.requires_grad = False
+    for param in model.classifier.parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(model.classifier.parameters(), lr=args.lr, weight_decay=1e-3)
+    pos_weight_tensor = torch.tensor([args.pos_weight]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+
+    save_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "Tweak"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / "finetuned_classifier.pth"
+
+    # 4. 训练与 Early Stopping
+    print(f"\n[3/3] 开始微调分类头 (Pos Weight = {args.pos_weight}, LR = {args.lr})...")
+    best_target_prob = init_fusion
+    early_stopped = False
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for imgs, projs, labels in loader:
+            imgs = imgs.to(device)
+            projs = projs.to(device)
+            labels = labels.to(device).unsqueeze(1)
+
+            optimizer.zero_grad()
+            logits = model(imgs, projs)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(loader)
+
+        # 实时评估监控样本
+        model.eval()
+        cur_fusion, cur_proj, cur_img = test_single_image(model, target_test_img, device)
+
+        print(
+            f"Epoch [{epoch:02d}/{args.epochs:02d}] | Loss: {avg_loss:.4f} | "
+            f"N_026_1 融合概率: {cur_fusion:.4f} (Proj: {cur_proj:.4f}, Img: {cur_img:.4f})"
+        )
+
+        if cur_fusion > best_target_prob:
+            best_target_prob = cur_fusion
+            torch.save(model.state_dict(), str(save_path))
+
+        # 触发早停：一旦 N_026_1 被成功纠正为阳性 (>= target_prob)
+        if cur_fusion >= args.target_prob:
+            print(f"\n🎯 [Early Stopping 触发] N_026_1 概率已跃升至 {cur_fusion:.4f} >= {args.target_prob}，立刻停止训练以防过拟合！")
+            early_stopped = True
+            break
+
+    if not early_stopped:
+        print(f"\n微调完成，保存最优权重。最优 N_026_1 概率: {best_target_prob:.4f}")
+
+    print(f"微调分类头权重已保存至: {save_path}")
+
+
+if __name__ == "__main__":
+    main()

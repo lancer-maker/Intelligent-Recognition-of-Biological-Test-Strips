@@ -19,7 +19,7 @@ from src.utils.model_helper import load_model_state
 
 # ================= 配置区 =================
 IMAGE_PATH = "data/test/raw/N_026_1.jpg"        # 待分析图像（如漏检阳性样本）
-MODEL_WEIGHTS = "outputs/checkpoints/P1/best_model.pth"  # 某个模型权重
+MODEL_WEIGHTS = "outputs/checkpoints/P24/best_model.pth"  # 某个模型权重
 CONFIG_PATH = "configs/main_config.yaml"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================
