@@ -53,7 +53,7 @@ class DualStreamStripNet(nn.Module):
         """
         Args:
             img_tensor: 形状为 (B, 3, 505, 220) 的图像 Tensor
-            proj_tensor: 形状为 (B, 1, 512) 的投影 Tensor
+            proj_tensor: 形状为 (B, C, 512) 的投影 Tensor (C=1/2/3, 视配置而定)
             
         Returns:
             logits: 形状为 (B, 1) 的未归一化二分类预测 Logits
@@ -88,7 +88,7 @@ if __name__ == "__main__":
     
     # 构造假数据 (Batch Size = 4)
     dummy_img = torch.randn(4, 3, 505, 220) # 2D 标准图像
-    dummy_proj = torch.randn(4, 1, 512)    # 1D 物理重采样投影
+    dummy_proj = torch.randn(4, net.proj_stream.in_channels, 512)  # 1D 物理重采样投影 (通道数随配置自动)
     
     # 前向传播测试
     logits = net(dummy_img, dummy_proj)

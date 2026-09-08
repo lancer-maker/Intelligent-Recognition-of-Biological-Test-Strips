@@ -18,8 +18,8 @@ def parse_filename(filename: str):
         label = parts[2]
         if label in ('0', '1'):
             return label, parts[1]
-    # 匿名格式 N_{序号}_{标签}
-    if parts[0] == 'N' and len(parts) == 3:
+    # 匿名格式 N/V_{序号}_{标签}
+    if parts[0] in ('N', 'V') and len(parts) == 3:
         label = parts[2]
         if label in ('0', '1'):
             return label, ''  # 项目ID留空
@@ -28,7 +28,7 @@ def parse_filename(filename: str):
 
 def main():
     # ========== 在这里直接修改路径 ==========
-    IMAGE_DIR = r"data\\test\\raw"      # 图片所在文件夹
+    IMAGE_DIR = r"data\test\raw"      # 图片所在文件夹
     OUTPUT_CSV = r"data\test\labels"  # 输出的CSV文件路径
     # ====================================
 

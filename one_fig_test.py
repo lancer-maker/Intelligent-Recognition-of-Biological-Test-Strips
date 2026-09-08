@@ -14,14 +14,19 @@ import cv2
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.utils import read_image_rgb, extract_1d_projection_resampled
+from src.data.utils import (
+    read_image_rgb,
+    extract_1d_projection_resampled,
+    extract_col_avg_projection_resampled,
+)
 from src.data.transforms import get_val_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 from src.utils.model_helper import load_model_state
 
 # ================= 配置区 =================
-IMAGE_PATH = r"data\test\raw\N_026_1.jpg"           # 待提取特征的图像路径
-MODEL_WEIGHTS = r"outputs\checkpoints\P24\best_model.pth"  # 模型权重路径
+IMAGE_PATH = r"data\test\raw\N_023_0.jpg"           # 待提取特征的图像路径
+# 注意: 必须是模型权重 .pth 文件, 不能是 .npy 概率文件
+MODEL_WEIGHTS = r"outputs\checkpoints\Tweak\3\best_model.pth"  # 模型权重路径
 CONFIG_PATH = "configs/main_config.yaml"           # 主配置文件
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================
@@ -50,10 +55,18 @@ def main():
     # 3.1 读取原始 RGB 图像（不缩放）
     raw_rgb = read_image_rgb(IMAGE_PATH)   # 返回 RGB 格式的原始图像 (H, W, 3)
 
-    # 3.2 提取投影曲线（基于原始图像，与训练一致）
+    # 3.2 提取投影（基于原始图像，与训练一致）; 适配双通道(行平均+可选中央ROI列平均)配置
+    use_col_avg = bool(data_cfg.get("proj_use_col_avg", False))
     proj_tensor = extract_1d_projection_resampled(
         raw_rgb, target_length=data_cfg['proj_length']
     )  # 形状 (1, proj_length)
+    if use_col_avg:
+        col_tensor = extract_col_avg_projection_resampled(
+            raw_rgb,
+            target_length=int(data_cfg.get("proj_col_length", 512)),
+            roi_fraction=float(data_cfg.get("proj_col_roi_fraction", 0.33)),
+        )
+        proj_tensor = torch.cat([proj_tensor, col_tensor], dim=0)  # (2, proj_length)
 
     # 3.3 图像流预处理：缩放到标准尺寸，进行验证集变换（归一化+转Tensor）
     target_w, target_h = data_cfg['standard_dpi_size']

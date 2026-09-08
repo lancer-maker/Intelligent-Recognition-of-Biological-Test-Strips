@@ -9,6 +9,10 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+# 必须在 import albumentations 之前设置, 否则其联网版本检查会在导入时触发
+# (产生无害但扰乱输出/退出码的 UserWarning)
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np

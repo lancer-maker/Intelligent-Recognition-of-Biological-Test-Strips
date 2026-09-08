@@ -8,7 +8,7 @@ system:
   project_name: "immunoassay_strip_reader"
   seed: 42                       # 全局随机种子，确保实验可复现
   device: "cuda"                 # 'cuda' 或 'cpu'
-  num_workers: 1                 # DataLoader 多线程加载数，正常设备上使用4及以上
+  num_workers: 8                 # DataLoader 多线程加载数，正常设备上使用4及以上
 
 # 2. 数据配置
 data:
@@ -17,31 +17,45 @@ data:
   qc_image_dir: "data\\raw\\control_strips"               # 质控纸带目录 # 可能后续用不到这个判断模块
   standard_dpi_size: [220, 505]  # [Width, Height] 2D 物理 DPI 对齐尺寸
   proj_length: 512               # 1D 物理信号重采样点数
+  # --- 投影流双通道增强 (行平均[纵向] + 列平均[横向]) ---
+  proj_use_col_avg: true        # 是否启用中央ROI列平均, 与行平均堆叠为双通道 (B,2,512); 启用后需从零训练
+  proj_col_roi_fraction: 0.33    # 列平均中央ROI区域比例 (高度方向中间 1/3)
+  proj_col_length: 512           # 列平均横向重采样长度
 
 # 3. 模型架构配置
 model:
   backbone_2d: "efficientnet_b0" # 2D 图像流骨干网络
   pretrained: true               # 是否加载 ImageNet 预训练权重
   feature_dim: 128               # 每个单流提取的特征维度 (2D:128, 1D:128)
-  dropout_rate: 0.5              # 分类头 Dropout 概率
+  dropout_rate: 0.6              # 分类头 Dropout 概率
+  # --- 投影流 1D CNN 架构 (层数 = 列表长度; 改回 [7,5,3] + [32,64,128] 即恢复原 3 层卷积) ---
+  proj_conv_kernel_sizes: [15, 9, 5, 3]      # 卷积核大小列表 (长度决定层数)
+  proj_conv_channels: [32, 64, 128, 256]     # 每层输出通道数 (与 kernel 列表等长)
+  # proj_conv_kernel_sizes: [7, 5, 3]      # 卷积核大小列表 (长度决定层数)
+  # proj_conv_channels: [32, 64, 128]     # 每层输出通道数 (与 kernel 列表等长)
+  proj_dropout_rate: 0.7                     # 投影流 fc 前 Dropout (防过拟合)
+  proj_add_position_channel: true            # 位置编码总开关: true=开启"可学习位置通道"(仅可学, 无固定坐标), false=关闭; 开启后需从零训练
 
 # 4. 两阶段训练策略配置
 training:
   optimizer: "AdamW"
   weight_decay: 0.001            # 权重衰减 (L2 正则化)
-  early_stopping_patience: 10     # 验证集 Loss 连续不下降允许的最大 Epoch 数，null为关闭
+  early_stopping_patience: 15     # 验证集 Loss 连续不下降允许的最大 Epoch 数，null为关闭
   
   # 阶段一：冻结 EfficientNet，训练 1D CNN 和分类头
   stage1:
-    epochs: 20
-    batch_size: 8                 # 笔记本上由16改为8
+    epochs: 60
+    batch_size: 96                 # 笔记本上由16改为8，16g显存使用64或96
     learning_rate: 0.0001        # 1e-4
 
-  # 阶段二：解冻 EfficientNet 全局微调
+  # 阶段二：解冻 EfficientNet 全局微调 (逐层解冻计划均在此配置)
   stage2:
-    epochs: 15
-    batch_size: 4                 # 笔记本上由8改为4
-    learning_rate: 0.00001       # 1e-5
+    epochs: 25
+    batch_size: 64                 # 笔记本上由8改为4
+    learning_rate: 0.000002       # 2e-6
+    unfreeze_interval: 4          # 每 N 个 epoch 解冻一层; 建议 3~4 (默认 3: 25 轮 Stage2 内可解冻完 7 层)
+    unfreeze_start_block: 6       # 解冻起始层: 从哪个 backbone block 开始 (EfficientNet-B0: 0~6, 最深=6, 一般从最深往前)
+    unfreeze_num_layers: 2        # 解冻层数: 从起始层向前共解冻多少层 (最大 7; 减小即少解冻浅层)
 
 # 5. 评估与阈值寻优策略配置
 evaluation:

@@ -1,3 +1,9 @@
+import os
+
+# 必须在 import albumentations 之前设置, 否则其联网版本检查会在导入时触发
+# (产生无害但扰乱输出/退出码的 UserWarning)
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 import cv2
 import numpy as np
 import albumentations as A
@@ -32,6 +38,7 @@ def test_dataset_applies_projection_color_augmentation_before_projection(tmp_pat
         projection_transforms=projection_transform,
         standard_dpi_size=(80, 40),
         proj_length=16,
+        use_col_avg=False,             # 测试聚焦"投影颜色增强", 关闭列平均以免受主配置影响
     )
 
     image_tensor, proj_tensor, label_tensor = dataset[0]

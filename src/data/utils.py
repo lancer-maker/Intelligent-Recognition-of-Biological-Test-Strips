@@ -97,3 +97,54 @@ def extract_1d_projection_resampled(image_rgb_raw: np.ndarray, target_length: in
     proj_tensor = torch.from_numpy(resampled_proj).float().unsqueeze(0)
     
     return proj_tensor
+
+
+def extract_col_avg_projection_resampled(
+    image_rgb_raw: np.ndarray,
+    target_length: int = 512,
+    roi_fraction: float = 0.33,
+) -> torch.Tensor:
+    """
+    【列平均(横向)投影】仅取中央 ROI 区域 (高度方向中间 roi_fraction), 对每一列沿高度求平均。
+
+    与行平均投影 (extract_1d_projection_resampled) 互补:
+      - 行平均(纵向): 捕捉 T/C 线在纵向 (高度/行) 的位置信息, 物理长度对应图像高度 5.05mm
+      - 列平均(横向): 仅中央 ROI 内沿高度求平均, 反映条带/色块沿横向 (宽度/列) 的分布,
+        物理长度对应试纸条宽度 2.2mm; 两者物理尺度不同, 作为特征输入网络可自行学习
+
+    Args:
+        image_rgb_raw: 原始 RGB 图像 (H, W, 3)
+        target_length: 重采样后的固定长度 (建议与行平均一致, 如 512)
+        roi_fraction: 中央 ROI 占高度方向的比例 (如 0.33 表示中间 1/3)
+
+    Returns:
+        torch.Tensor: 形状 (1, target_length) 的横向投影 Tensor
+    """
+    gray = cv2.cvtColor(image_rgb_raw, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape[:2]
+
+    # 1. 确定中央 ROI (高度方向中间 roi_fraction)
+    roi_h = max(1, int(round(h * roi_fraction)))
+    start_y = (h - roi_h) // 2
+    roi = gray[start_y:start_y + roi_h, :]
+
+    # 2. 对每一列沿高度(axis=0)求平均 -> 长度 = 宽度 W
+    raw_proj = np.mean(roi, axis=0, dtype=np.float32)
+    raw_length = len(raw_proj)
+
+    # 3. Min-Max 基础归一化
+    raw_proj_norm = (raw_proj - raw_proj.min()) / (raw_proj.max() - raw_proj.min() + 1e-6)
+
+    # 4. 一维线性插值重采样到固定长度 (物理尺度按试纸宽度 2.2mm 注释)
+    if raw_length != target_length:
+        x_raw = np.linspace(0, 2.2, num=raw_length)
+        x_target = np.linspace(0, 2.2, num=target_length)
+        resampled_proj = np.interp(x_target, x_raw, raw_proj_norm)
+    else:
+        resampled_proj = raw_proj_norm
+
+    # 5. 去基线 (与行平均保持相同的预处理)
+    resampled_proj = normalize_projection_baseline(resampled_proj)
+
+    # 6. 转 Tensor -> (1, target_length)
+    return torch.from_numpy(resampled_proj).float().unsqueeze(0)

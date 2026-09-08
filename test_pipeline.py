@@ -2,6 +2,7 @@
 =====================================================================
 极简版双流模型训练与交叉验证脚本
 直接读取固定 CSV，生成指定产物: loocv_predictions.csv & summary_metrics.csv
+24折交叉验证，逐折训练并预测，计算约登指数最佳阈值与 AUC 95% CI。
 =====================================================================
 """
 import os
@@ -22,7 +23,7 @@ from src.data.dataset import TestStripDataset
 from src.data.transforms import get_train_transforms, get_val_transforms, get_projection_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 from src.training.trainer import StageTrainer
-from src.evaluation.threshold_optimize import calculate_best_threshold, summarize_loocv_results
+from src.evaluation.threshold_optimize import calculate_best_threshold, summarize_loocv_results, compute_auc_ci
 from src.utils.logger import setup_logger
 
 
@@ -180,14 +181,24 @@ def main(config_path: str = "configs/main_config.yaml"):
         # 计算约登指数最佳阈值与指标
         best_th, sens, spec, acc, roc_auc = calculate_best_threshold(val_targets, val_preds)
 
+        # Bootstrap 计算本折 AUC 的 95% 置信区间 (小样本区间较宽, 如实呈现不确定性)
+        _, auc_ci_low, auc_ci_high = compute_auc_ci(
+            val_targets, val_preds, n_bootstraps=1000, alpha=0.95, seed=42 + fold_idx
+        )
+
         fold_summaries.append({
             'patient_id': val_patient_id,
             'best_threshold': best_th,
             'auc': roc_auc,
+            'auc_ci_low': auc_ci_low,
+            'auc_ci_high': auc_ci_high,
             'accuracy': acc,
             'sensitivity': sens,
             'specificity': spec
         })
+
+        ci_str = (f"[{auc_ci_low:.4f}, {auc_ci_high:.4f}]" if auc_ci_low is not None else "[N/A]")
+        print(f"Fold {val_patient_id}: AUC={roc_auc:.4f} | 95% CI={ci_str}")
 
         # 记录每张图片的预测结果
         val_df['pred_prob'] = val_preds

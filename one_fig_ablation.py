@@ -14,20 +14,33 @@ import sys
 import yaml
 import torch
 import cv2
+import pandas as pd
 from pathlib import Path
 
 # 加入项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.data.utils import read_image_rgb, extract_1d_projection_resampled
+from src.data.utils import (
+    read_image_rgb,
+    extract_1d_projection_resampled,
+    extract_col_avg_projection_resampled,
+)
 from src.data.transforms import get_val_transforms
 from src.models.dual_stream_net import DualStreamStripNet
 
 # ================= 配置区 =================
-IMAGE_PATH = r"data\test\raw\N_030_0.jpg"        # 待分析图像（如漏检阳性样本）
-MODEL_WEIGHTS = r"outputs\checkpoints\Tweak\finetuned_classifier.pth"  # 某个模型权重
+IMAGE_PATH = r"data\test\raw\N_023_0.jpg"        # 待分析图像（如漏检阳性样本）
+# 支持多个模型权重, 用逗号分隔 (输入多少就消融多少, 输出一份汇总报告, 无需重复手工跑)
+MODEL_WEIGHTS = (
+    r"outputs\checkpoints\Tweak\1\best_model.pth,"
+    r"outputs\checkpoints\Tweak\2\best_model.pth,"
+    r"outputs\checkpoints\Tweak\3\best_model.pth,"
+    r"outputs\checkpoints\Tweak\4\best_model.pth,"
+    r"outputs\checkpoints\Tweak\5\best_model.pth"
+)
 CONFIG_PATH = "configs/main_config.yaml"
+REPORT_CSV = r"outputs\reports\one_fig_ablation.csv"  # 消融汇总报告 (None 则不写文件)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ==========================================
 
@@ -40,29 +53,22 @@ def main():
     model_cfg = cfg['model']
     data_cfg = cfg['data']
 
-    # 加载模型
-    model = DualStreamStripNet(
-        pretrained_2d=model_cfg['pretrained'],
-        feature_dim=model_cfg['feature_dim'],
-        dropout_rate=model_cfg['dropout_rate']
-    )
-    checkpoint = torch.load(MODEL_WEIGHTS, map_location='cpu')
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-    model.load_state_dict(state_dict)
-    model.to(DEVICE)
-    model.eval()
-
-    # 读取原始图像
+    # 1. 预处理图像 (一次即可, 供所有模型共用)
     raw_rgb = read_image_rgb(IMAGE_PATH)
 
-    # 提取投影
+    # 1.1 投影流: 适配双通道 (行平均 + 可选中央ROI列平均)
+    use_col_avg = bool(data_cfg.get("proj_use_col_avg", False))
     proj_tensor = extract_1d_projection_resampled(raw_rgb, target_length=data_cfg['proj_length'])
-    proj_tensor = proj_tensor.unsqueeze(0).to(DEVICE)  # (1, 1, proj_length)
+    if use_col_avg:
+        col_tensor = extract_col_avg_projection_resampled(
+            raw_rgb,
+            target_length=int(data_cfg.get("proj_col_length", 512)),
+            roi_fraction=float(data_cfg.get("proj_col_roi_fraction", 0.33)),
+        )
+        proj_tensor = torch.cat([proj_tensor, col_tensor], dim=0)  # (2, 512)
+    proj_tensor = proj_tensor.unsqueeze(0).to(DEVICE)
 
-    # 图像流预处理
+    # 1.2 图像流: 缩放到标准尺寸并做验证集变换
     target_w, target_h = data_cfg['standard_dpi_size']
     h, w = raw_rgb.shape[:2]
     if (w, h) != (target_w, target_h):
@@ -74,34 +80,72 @@ def main():
     augmented = val_transforms(image=dpi_aligned_rgb)
     image_tensor = augmented['image'].unsqueeze(0).to(DEVICE)  # (1, 3, 505, 220)
 
-    # 提取两个流的特征
-    with torch.no_grad():
-        img_feats = model.image_stream(image_tensor)  # (1, 128)
-        proj_feats = model.proj_stream(proj_tensor)  # (1, 128)
+    # 2. 解析模型权重 (逗号分隔, 输入多少就消融多少)
+    weight_paths = [p.strip() for p in str(MODEL_WEIGHTS).split(",") if p.strip()]
+    if not weight_paths:
+        print("[错误] 未提供有效模型权重路径。")
+        return
 
-        # 正常预测
-        fused_normal = torch.cat((img_feats, proj_feats), dim=1)
-        logits_normal = model.classifier(fused_normal)
-        prob_normal = torch.sigmoid(logits_normal).item()
-
-        # 仅投影流（图像特征置零）
-        img_zero = torch.zeros_like(img_feats)
-        fused_only_proj = torch.cat((img_zero, proj_feats), dim=1)
-        logits_only_proj = model.classifier(fused_only_proj)
-        prob_only_proj = torch.sigmoid(logits_only_proj).item()
-
-        # 仅图像流（投影特征置零）
-        proj_zero = torch.zeros_like(proj_feats)
-        fused_only_img = torch.cat((img_feats, proj_zero), dim=1)
-        logits_only_img = model.classifier(fused_only_img)
-        prob_only_img = torch.sigmoid(logits_only_img).item()
-
-    print("=" * 60)
+    # 3. 对每个模型做消融
+    print("=" * 80)
     print(f"图像: {IMAGE_PATH}")
-    print(f"正常预测概率: {prob_normal:.4f}")
-    print(f"仅投影流概率: {prob_only_proj:.4f}")
-    print(f"仅图像流概率: {prob_only_img:.4f}")
-    print("=" * 60)
+    results = []
+    for i, wp in enumerate(weight_paths, 1):
+        model = DualStreamStripNet(
+            pretrained_2d=model_cfg['pretrained'],
+            feature_dim=model_cfg['feature_dim'],
+            dropout_rate=model_cfg['dropout_rate']
+        )
+        checkpoint = torch.load(wp, map_location='cpu')
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        model.load_state_dict(state_dict)
+        model.to(DEVICE)
+        model.eval()
+
+        with torch.no_grad():
+            img_feats = model.image_stream(image_tensor)   # (1, 128)
+            proj_feats = model.proj_stream(proj_tensor)    # (1, 128)
+
+            # 正常: 图像 + 投影
+            logits_normal = model.classifier(torch.cat((img_feats, proj_feats), dim=1))
+            prob_normal = torch.sigmoid(logits_normal).item()
+
+            # 仅投影: 图像特征置零
+            img_zero = torch.zeros_like(img_feats)
+            logits_only_proj = model.classifier(torch.cat((img_zero, proj_feats), dim=1))
+            prob_only_proj = torch.sigmoid(logits_only_proj).item()
+
+            # 仅图像: 投影特征置零
+            proj_zero = torch.zeros_like(proj_feats)
+            logits_only_img = model.classifier(torch.cat((img_feats, proj_zero), dim=1))
+            prob_only_img = torch.sigmoid(logits_only_img).item()
+
+        results.append({
+            "model_id": i,
+            "weight_path": wp,
+            "normal_prob": float(prob_normal),
+            "only_proj_prob": float(prob_only_proj),
+            "only_img_prob": float(prob_only_img),
+        })
+        print(f"  [{i}/{len(weight_paths)}] 模型权重: {Path(wp).parent.name}/{Path(wp).name}")
+
+    # 4. 汇总表 (一次打印所有模型, 避免重复报告)
+    print("\n消融汇总 (正常 / 仅投影 / 仅图像 概率):")
+    print("-" * 80)
+    for r in results:
+        print(f"  模型 {r['model_id']}: 正常={r['normal_prob']:.4f} | "
+              f"仅投影={r['only_proj_prob']:.4f} | 仅图像={r['only_img_prob']:.4f}")
+    print("=" * 80)
+
+    # 5. 写汇总报告 CSV (替代重复手工记录)
+    if REPORT_CSV:
+        out = Path(REPORT_CSV)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(results).to_csv(out, index=False)
+        print(f"消融汇总报告已保存: {out}")
 
 if __name__ == "__main__":
     main()
